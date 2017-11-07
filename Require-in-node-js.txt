@@ -1,0 +1,183 @@
+The intresting question is the 'require' in node js is the same with 'requirejs' library.
+
+e.g. a.js
+
+    var b = require('./b.js');
+    ...
+
+Here, what's the require for? How's it implemented?
+
+
+To understand it, we need dive into the nodejs source code - https://github.com/nodejs/node. It's open source, read some of comments in code, we can
+get how's it going.
+
+1. I got a comment from node/lib/internal/bootstrap_node.js, paste it as below.
+
+	// Hello, and welcome to hacking node.js!
+	//
+	// This file is invoked by node::LoadEnvironment in src/node.cc, and is
+	// responsible for bootstrapping the node.js core. As special caution is given
+	// to the performance of the startup process, many dependencies are invoked
+	// lazily.
+	
+	So, we know that the node js boostrap from this js - bootstrap_node.js.
+	
+2. After read bootstrap_node.js in #1. We get a js internal object.
+   
+		  function NativeModule(id) {
+			this.filename = `${id}.js`;
+			this.id = id;
+			this.exports = {};
+			this.loaded = false;
+			this.loading = false;
+		  }   
+
+		  NativeModule.require = function(id) {
+			... 
+			const nativeModule = new NativeModule(id);
+			nativeModule.cache();
+			nativeModule.compile();
+			return nativeModule.exports;
+		  };
+		  NativeModule.wrap = function(script) {
+			return NativeModule.wrapper[0] + script + NativeModule.wrapper[1];
+		  };
+
+		  NativeModule.wrapper = [
+			'(function (exports, require, module, internalBinding) {',
+			'\n});'
+		  ];
+	     ...		
+		 NativeModule.prototype.compile = function() {
+			var source = NativeModule.getSource(this.id);
+			source = NativeModule.wrap(source);
+
+			this.loading = true;
+
+			try {
+			  const fn = runInThisContext(source, {
+				filename: this.filename,
+				lineOffset: 0,
+				displayErrors: true
+			  });
+			  fn(this.exports, NativeModule.require, this, internalBinding);// important line
+
+			  this.loaded = true;
+			} finally {
+			  this.loading = false;
+			}
+		  };
+		  
+	This class is used to load the inner module which is coded in Javascript, e.g. node/lib/module.js, node/lib/http.js.
+	a. NativeModule.require('lib/http.js');
+	b. Initialize a NativeModule with an id - id is the file path.
+	c. Wrap souce code of '/lib/http.js' with in ('function (exports, require, module, internalBinding) { source code })', then initialize it with 'fn(this.exports, NativeModule.require, this, internalBinding);'.
+	d. After #c '/lib/http.js' is scoped in a closure, we can only refer by it's returned value - return nativeModule.exports;
+	
+	Recap, each inner inner js file is going to be scoped and exposed by a NativeModule instance's exports property.
+	
+3. In bootstrap_node.js, we get a line '  const Module = NativeModule.require('module'); Module.runMain();'. So it's going to load the file 'lib/module.js' which is related to our question.
+   
+   const NativeModule = require('native_module'); // here the require if from NativeModule.require in step 2.
+   ...
+   function Module(id, parent) {
+	  this.id = id;
+	  this.exports = {};
+	  this.parent = parent;
+	  updateChildren(parent, this, false);
+	  this.filename = null;
+	  this.loaded = false;
+	  this.children = [];
+	}
+	module.exports = Module;   
+	
+	Module.wrap = function(script) {
+	  return Module.wrapper[0] + script + Module.wrapper[1];
+	};
+
+	Module.wrapper = [
+	  '(function (exports, require, module, __filename, __dirname) { ',
+	  '\n});'
+	];
+ 
+    Module.runMain = function() {	   // here is the entry of the 'lib/module.js'
+	  Module._load(process.argv[1], null, true); // resume we use cmd in node prompt: node 'a.js', process.argv[1] is right 'a.js'.
+	  process._tickCallback();
+	};
+	
+	function tryModuleLoad(module, filename) {
+	  var threw = true;
+	  try {
+		module.load(filename);
+		threw = false;
+	  } finally {
+		if (threw) {
+		  delete Module._cache[filename];
+		}
+	 }
+	
+	Module._load = function(request, parent, isMain) {
+	...
+	  var module = new Module(filename, parent);
+	  tryModuleLoad(module, filename);
+	  return module.exports;
+	};
+   
+   Module.prototype.load = function(filename) {
+	  this.filename = filename;
+	  this.paths = Module._nodeModulePaths(path.dirname(filename));
+	  var extension = path.extname(filename) || '.js';
+	  if (!Module._extensions[extension]) extension = '.js';
+	  Module._extensions[extension](this, filename);
+	  this.loaded = true;
+	  ...
+	};
+	
+	Module.prototype.require = function(path) {	   
+	  return Module._load(path, this, /* isMain */ false);
+	};
+ 
+	Module.prototype._compile = function(content, filename) {  
+	  var wrapper = Module.wrap(content);
+	  var compiledWrapper = vm.runInThisContext(wrapper, {
+		filename: filename,
+		lineOffset: 0,
+		displayErrors: true
+	  });
+	  var inspectorWrapper = null;	 
+	  var dirname = path.dirname(filename);
+	  var require = internalModule.makeRequireFunction(this);
+	  var depth = internalModule.requireDepth;
+	  if (depth === 0) stat.cache = new Map();
+	  var result;
+	  if (inspectorWrapper) {
+		result = inspectorWrapper(compiledWrapper, this.exports, this.exports,require, this, filename, dirname);
+	  } else {
+		result = compiledWrapper.call(this.exports, this.exports, require, this,filename, dirname); //wrap the programmer's js as a scope a module and expose it by an instance of Module's exporpts property.
+	  }
+	  if (depth === 0) stat.cache = null;
+	  return result;
+	};
+
+	// Native extension for .js
+	Module._extensions['.js'] = function(module, filename) {
+	  var content = fs.readFileSync(filename, 'utf8');
+	  module._compile(internalModule.stripBOM(content), filename);
+	};
+
+4. Recap #3, nodejs load and compile 'lib/Module.js' as an inner Module which expose as an API for wrap a programmer's code as a customer Module, it's purpose is to scope the code.
+   Tips for #3, 'lib/Module.js' is used as an API for programmer to use require other customer modules, but in it's souce code, we can see it uses "require('native_module');", because here's require comes from
+   the NativeModule's API require rather than it's own's API require.
+   
+5. Recap the whole magic.
+   
+   a. cmd, Node './customer.js'
+   b. Node scope the './customer.js' and expose it by an instance Module's exports property.
+   c. Require in the './customer.js' is the instance Module's require method.
+   d. Each customer module get an instance of Module respectively. So it's scoped and accessable by module.exports only.
+   
+6. As the poor English, I don't express it clearly. Please refer to the nodejs source code and the steps above can be a reference.
+  
+	
+ 
+ 
